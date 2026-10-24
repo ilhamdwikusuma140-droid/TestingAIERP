@@ -1,0 +1,13 @@
+# Rahasia: jangan pernah di-commit
+.env
+.env.*
+!.env.example
+
+# Supabase CLI
+supabase/.temp/
+
+# Lain-lain
+node_modules/
+.DS_Store
+*.log
+
