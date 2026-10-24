@@ -1,0 +1,220 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Masuk - Ilham-ERP</title>
+  <style>
+    :root {
+      --bg: #f5f6f8; --card: #ffffff; --text: #1b1f24; --muted: #667085;
+      --border: #d0d5dd; --accent: #1f7a4d; --accent-text: #ffffff; --danger: #b42318;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #111418; --card: #1a1f25; --text: #e8eaed; --muted: #98a2b3;
+        --border: #344054; --accent: #2fa86b; --accent-text: #08150e; --danger: #f97066;
+      }
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center;
+      background: var(--bg); color: var(--text);
+      font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; padding: 16px;
+    }
+    .card {
+      width: 100%; max-width: 380px; background: var(--card);
+      border: 1px solid var(--border); border-radius: 12px; padding: 22px;
+    }
+    h1 { font-size: 1.25rem; margin: 0 0 4px; }
+    p.sub { margin: 0 0 16px; color: var(--muted); font-size: 0.9rem; }
+    .tabs { display: flex; gap: 8px; margin-bottom: 14px; }
+    .tabs button {
+      flex: 1; padding: 9px; border: 1px solid var(--border); background: transparent;
+      color: var(--text); border-radius: 8px; font-size: 0.95rem; cursor: pointer;
+    }
+    .tabs button.active { background: var(--accent); color: var(--accent-text); border-color: var(--accent); }
+    label { display: block; font-size: 0.85rem; margin: 10px 0 4px; color: var(--muted); }
+    input {
+      width: 100%; padding: 11px; border: 1px solid var(--border); border-radius: 8px;
+      background: transparent; color: var(--text); font-size: 1rem;
+    }
+    .btn {
+      width: 100%; margin-top: 16px; padding: 12px; border: 0; border-radius: 8px;
+      background: var(--accent); color: var(--accent-text); font-size: 1rem; font-weight: 600; cursor: pointer;
+    }
+    .btn:disabled { opacity: 0.6; cursor: wait; }
+    .btn.ghost { background: transparent; color: var(--text); border: 1px solid var(--border); margin-top: 10px; }
+    .msg { margin-top: 12px; font-size: 0.9rem; min-height: 1.2em; }
+    .msg.error { color: var(--danger); }
+    .msg.ok { color: var(--accent); }
+    .company {
+      display: flex; justify-content: space-between; align-items: center; gap: 10px;
+      border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; margin-bottom: 8px;
+    }
+    .company .name { font-weight: 600; }
+    .company .meta { font-size: 0.8rem; color: var(--muted); }
+    .company button {
+      padding: 8px 14px; border: 0; border-radius: 6px; background: var(--accent);
+      color: var(--accent-text); font-weight: 600; cursor: pointer;
+    }
+    hr { border: 0; border-top: 1px solid var(--border); margin: 16px 0 6px; }
+    .hidden { display: none; }
+  </style>
+</head>
+<body>
+  <div class="card">
+
+    <!-- Langkah 1: login / daftar -->
+    <div id="stepAuth">
+      <h1>Ilham-ERP</h1>
+      <p class="sub">Masuk atau buat akun untuk mengelola usaha Anda.</p>
+      <div class="tabs">
+        <button type="button" id="tabLogin" class="active">Masuk</button>
+        <button type="button" id="tabSignup">Daftar</button>
+      </div>
+      <form id="authForm">
+        <label for="email">Email</label>
+        <input id="email" type="email" autocomplete="email" required>
+        <label for="password">Kata sandi</label>
+        <input id="password" type="password" minlength="6" autocomplete="current-password" required>
+        <button class="btn" id="authBtn" type="submit">Masuk</button>
+      </form>
+      <div class="msg" id="authMsg"></div>
+    </div>
+
+    <!-- Langkah 2: pilih / buat usaha -->
+    <div id="stepBusiness" class="hidden">
+      <h1>Pilih usaha</h1>
+      <p class="sub" id="whoami"></p>
+      <div id="companyList"></div>
+      <hr>
+      <form id="createForm">
+        <label for="namaUsaha">Buat usaha baru</label>
+        <input id="namaUsaha" type="text" placeholder="Nama usaha" required>
+        <button class="btn" id="createBtn" type="submit">Buat usaha</button>
+      </form>
+      <button class="btn ghost" id="logoutBtn" type="button">Keluar</button>
+      <div class="msg" id="bizMsg"></div>
+    </div>
+
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.js"></script>
+  <script src="assets/supabase-client.js"></script>
+  <script>
+    var mode = 'login'; // 'login' | 'signup'
+
+    var $ = function (id) { return document.getElementById(id); };
+
+    function setMsg(el, text, type) {
+      el.textContent = text || '';
+      el.className = 'msg' + (type ? ' ' + type : '');
+    }
+
+    function setMode(m) {
+      mode = m;
+      $('tabLogin').classList.toggle('active', m === 'login');
+      $('tabSignup').classList.toggle('active', m === 'signup');
+      $('authBtn').textContent = m === 'login' ? 'Masuk' : 'Daftar';
+      $('password').autocomplete = m === 'login' ? 'current-password' : 'new-password';
+      setMsg($('authMsg'), '');
+    }
+
+    $('tabLogin').onclick = function () { setMode('login'); };
+    $('tabSignup').onclick = function () { setMode('signup'); };
+
+    $('authForm').onsubmit = async function (e) {
+      e.preventDefault();
+      var email = $('email').value.trim();
+      var password = $('password').value;
+      $('authBtn').disabled = true;
+      setMsg($('authMsg'), 'Memproses...');
+      try {
+        var res;
+        if (mode === 'login') {
+          res = await supabaseClient.auth.signInWithPassword({ email: email, password: password });
+        } else {
+          res = await supabaseClient.auth.signUp({ email: email, password: password });
+        }
+        if (res.error) throw res.error;
+        if (!res.data.session) {
+          setMsg($('authMsg'), 'Akun dibuat. Cek email untuk verifikasi, lalu masuk.', 'ok');
+        } else {
+          await showBusinessStep(res.data.session);
+        }
+      } catch (err) {
+        setMsg($('authMsg'), err.message || 'Gagal. Coba lagi.', 'error');
+      } finally {
+        $('authBtn').disabled = false;
+      }
+    };
+
+    async function showBusinessStep(session) {
+      $('stepAuth').classList.add('hidden');
+      $('stepBusiness').classList.remove('hidden');
+      $('whoami').textContent = session.user.email;
+      setMsg($('bizMsg'), 'Memuat usaha...');
+      try {
+        var companies = await listMyCompanies();
+        renderCompanies(companies);
+        setMsg($('bizMsg'), companies.length ? '' : 'Belum ada usaha. Buat usaha pertama Anda.');
+      } catch (err) {
+        setMsg($('bizMsg'), err.message || 'Gagal memuat usaha.', 'error');
+      }
+    }
+
+    function renderCompanies(list) {
+      var box = $('companyList');
+      box.textContent = '';
+      list.forEach(function (c) {
+        var row = document.createElement('div');
+        row.className = 'company';
+        var info = document.createElement('div');
+        var name = document.createElement('div');
+        name.className = 'name';
+        name.textContent = c.nama;
+        var meta = document.createElement('div');
+        meta.className = 'meta';
+        meta.textContent = 'Kode: ' + c.kode_usaha + ' · ' + c.role;
+        info.appendChild(name);
+        info.appendChild(meta);
+        var btn = document.createElement('button');
+        btn.type = 'button';
+        btn.textContent = 'Pilih';
+        btn.onclick = function () { chooseCompany(c.id); };
+        row.appendChild(info);
+        row.appendChild(btn);
+        box.appendChild(row);
+      });
+    }
+
+    function chooseCompany(id) {
+      setActiveBusinessId(id);
+      window.location.href = 'index.html';
+    }
+
+    $('createForm').onsubmit = async function (e) {
+      e.preventDefault();
+      var nama = $('namaUsaha').value.trim();
+      if (!nama) return;
+      $('createBtn').disabled = true;
+      setMsg($('bizMsg'), 'Membuat usaha...');
+      try {
+        var company = await createCompany(nama);
+        chooseCompany(company.id);
+      } catch (err) {
+        setMsg($('bizMsg'), err.message || 'Gagal membuat usaha.', 'error');
+        $('createBtn').disabled = false;
+      }
+    };
+
+    $('logoutBtn').onclick = function () { signOut(); };
+
+    // Jika sudah login, langsung ke langkah pilih usaha
+    (async function init() {
+      var res = await supabaseClient.auth.getSession();
+      if (res.data.session) await showBusinessStep(res.data.session);
+    })();
+  </script>
+</body>
+</html>
