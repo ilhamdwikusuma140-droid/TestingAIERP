@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Data Usaha - Ilham ERP</title>
 <link rel="stylesheet" href="assets/style.css">
+<style>html.auth-pending body { visibility: hidden; }</style>
 </head>
 <body>
 
@@ -28,9 +29,11 @@
 
     <main class="content">
 
+      <div class="status-line" style="margin-bottom:10px"><a href="#" id="logoutLink">Keluar</a></div>
+
       <div class="card">
         <h2 id="formTitle">➕ Tambah Data Usaha</h2>
-        <p class="card-sub">Setiap usaha memiliki COA dan transaksi masing-masing berdasarkan <strong>businessId</strong>.</p>
+        <p class="card-sub">Setiap usaha memiliki COA dan transaksi masing-masing. <strong>Kode usaha</strong> dibuat otomatis dan dipakai untuk menghubungkan kasir.</p>
 
         <form id="businessForm">
 
@@ -67,6 +70,7 @@
               <tr>
                 <th>No</th>
                 <th>Nama Usaha</th>
+                <th>Kode</th>
                 <th>Alamat</th>
                 <th>Periode</th>
                 <th>Mulai Periode</th>
@@ -85,92 +89,122 @@
 
 </div>
 
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.js"></script>
+<script src="assets/supabase-client.js"></script>
 <script src="assets/app.js"></script>
 <script>
 
-  ERP.initLayout({
-    active: "business",
-    title: "Data Usaha",
-    subtitle: "Kelola data usaha dan periode akuntansi"
-  });
+  document.documentElement.classList.add("auth-pending");
 
   let editingId = null;
+  let session = null;
+  let companies = [];     // { id, name, kode, address, period, periodStart, role }
+
+  function activeId() {
+    const saved = getActiveBusinessId();
+    if (saved && companies.some(function (c) { return ERP.idEqual(c.id, saved); })) return saved;
+    if (companies.length) { setActiveBusinessId(companies[0].id); return companies[0].id; }
+    return null;
+  }
+
+  async function loadCompanies() {
+    const c = await supabaseClient.from("companies")
+      .select("id, nama, kode_usaha, alamat, tahun_buku, period_start").order("created_at");
+    const m = await supabaseClient.from("business_members").select("business_id, role").eq("user_id", session.user.id);
+    if (c.error || m.error) {
+      alert("Gagal memuat usaha: " + ((c.error || m.error).message));
+      return false;
+    }
+    const roles = {};
+    m.data.forEach(function (x) { roles[x.business_id] = x.role; });
+    companies = c.data.map(function (x) {
+      return {
+        id: x.id, name: x.nama, kode: x.kode_usaha, address: x.alamat || "",
+        period: x.tahun_buku ? String(x.tahun_buku) : "", periodStart: x.period_start || "",
+        role: roles[x.id] || "staff"
+      };
+    });
+    return true;
+  }
+
+  function renderBadge() {
+    const badge = document.getElementById("activeBusinessBadge");
+    const active = companies.find(function (c) { return ERP.idEqual(c.id, activeId()); });
+    if (!active) {
+      badge.innerHTML = '<span class="badge-dot badge-dot-warn"></span><span>Belum ada usaha aktif</span>';
+      badge.classList.add("is-empty");
+      return;
+    }
+    badge.classList.remove("is-empty");
+    badge.innerHTML = '<span class="badge-dot"></span><span><strong>' + ERP.escapeHTML(active.name) +
+      '</strong> · Tahun Buku ' + ERP.escapeHTML(active.period || "-") + '</span>';
+  }
+
+  document.getElementById("logoutLink").addEventListener("click", function (e) {
+    e.preventDefault();
+    signOut();
+  });
 
   /* ===== SUBMIT FORM ===== */
 
-  document.getElementById("businessForm").addEventListener("submit", function (event) {
+  document.getElementById("businessForm").addEventListener("submit", async function (event) {
     event.preventDefault();
 
     const name = document.getElementById("businessName").value.trim();
     const address = document.getElementById("businessAddress").value.trim();
     const period = document.getElementById("businessPeriod").value.trim();
-    const periodStart = document.getElementById("periodStart").value || "";
+    const periodStart = document.getElementById("periodStart").value || null;
 
     if (!name || !period) {
       alert("Nama usaha dan tahun buku wajib diisi.");
       return;
     }
 
-    const businesses = ERP.getBusinesses();
+    const saveBtn = document.getElementById("saveButton");
+    saveBtn.disabled = true;
 
     if (editingId !== null) {
+      const res = await supabaseClient.from("companies")
+        .update({ nama: name, alamat: address || null, tahun_buku: Number(period), period_start: periodStart })
+        .eq("id", editingId).select("id");
+      saveBtn.disabled = false;
 
-      const index = businesses.findIndex(b => ERP.idEqual(b.id, editingId));
+      if (res.error) { alert("Gagal memperbarui usaha: " + res.error.message); return; }
+      if (!res.data || res.data.length === 0) { alert("Hanya owner usaha yang boleh mengubah data usaha."); return; }
 
-      if (index === -1) {
-        alert("Usaha tidak ditemukan.");
-        return;
-      }
-
-      businesses[index] = { ...businesses[index], name, address, period, periodStart };
-      ERP.saveBusinesses(businesses);
       alert("Data usaha berhasil diperbarui.");
-
     } else {
+      const res = await supabaseClient.rpc("create_company", {
+        p_nama: name, p_alamat: address || null, p_tahun_buku: Number(period), p_period_start: periodStart
+      });
+      saveBtn.disabled = false;
 
-      const newBusiness = {
-        id: String(Date.now()),
-        name,
-        address,
-        period,
-        periodStart,
-        createdAt: new Date().toISOString()
-      };
+      if (res.error) { alert("Gagal menyimpan usaha: " + res.error.message); return; }
 
-      businesses.push(newBusiness);
-      ERP.saveBusinesses(businesses);
-      ERP.setActiveBusiness(newBusiness.id);
-
-      alert("Usaha berhasil disimpan dan menjadi usaha aktif.");
+      setActiveBusinessId(res.data.id);
+      alert("Usaha berhasil disimpan dan menjadi usaha aktif.\nKode usaha: " + res.data.kode_usaha);
     }
 
     resetForm();
+    await loadCompanies();
     render();
   });
 
   /* ===== PILIH USAHA ===== */
 
   function selectBusiness(id) {
-    const business = ERP.getBusinesses().find(b => ERP.idEqual(b.id, id));
-
-    if (!business) {
-      alert("Usaha tidak ditemukan.");
-      return;
-    }
-
-    ERP.setActiveBusiness(business.id);
+    const business = companies.find(function (b) { return ERP.idEqual(b.id, id); });
+    if (!business) { alert("Usaha tidak ditemukan."); return; }
+    setActiveBusinessId(business.id);
     render();
   }
 
   /* ===== EDIT USAHA ===== */
 
   function editBusiness(id) {
-    const business = ERP.getBusinesses().find(b => ERP.idEqual(b.id, id));
-
-    if (!business) {
-      alert("Usaha tidak ditemukan.");
-      return;
-    }
+    const business = companies.find(function (b) { return ERP.idEqual(b.id, id); });
+    if (!business) { alert("Usaha tidak ditemukan."); return; }
+    if (business.role !== "owner") { alert("Hanya owner usaha yang boleh mengubah data usaha."); return; }
 
     editingId = business.id;
 
@@ -188,38 +222,26 @@
 
   /* ===== HAPUS USAHA ===== */
 
-  function deleteBusiness(id) {
-    const businesses = ERP.getBusinesses();
-    const business = businesses.find(b => ERP.idEqual(b.id, id));
+  async function deleteBusiness(id) {
+    const business = companies.find(function (b) { return ERP.idEqual(b.id, id); });
+    if (!business) { alert("Usaha tidak ditemukan."); return; }
+    if (business.role !== "owner") { alert("Hanya owner usaha yang boleh menghapus usaha."); return; }
 
-    if (!business) {
-      alert("Usaha tidak ditemukan.");
-      return;
-    }
-
-    const confirmed = confirm(
-      `Yakin ingin menghapus usaha "${business.name}"?\n\nData COA dan transaksi usaha ini tidak otomatis dihapus.`
+    const typed = prompt(
+      'PERINGATAN: menghapus usaha "' + business.name + '" juga MENGHAPUS PERMANEN seluruh COA, transaksi, dan data lain milik usaha ini.\n\n' +
+      "Ketik nama usaha persis untuk melanjutkan:"
     );
+    if (typed === null) return;
+    if (typed.trim() !== business.name) { alert("Nama tidak cocok. Penghapusan dibatalkan."); return; }
 
-    if (!confirmed) return;
+    const res = await supabaseClient.from("companies").delete().eq("id", id).select("id");
+    if (res.error) { alert("Gagal menghapus usaha: " + res.error.message); return; }
+    if (!res.data || res.data.length === 0) { alert("Usaha tidak dapat dihapus."); return; }
 
-    const newBusinesses = businesses.filter(b => !ERP.idEqual(b.id, id));
-    ERP.saveBusinesses(newBusinesses);
+    if (ERP.idEqual(getActiveBusinessId(), id)) clearActiveBusinessId();
+    if (editingId !== null && ERP.idEqual(editingId, id)) resetForm();
 
-    const currentActiveId = localStorage.getItem("ilhamERP_activeBusiness");
-
-    if (ERP.idEqual(currentActiveId, id)) {
-      if (newBusinesses.length > 0) {
-        ERP.setActiveBusiness(newBusinesses[0].id);
-      } else {
-        localStorage.removeItem("ilhamERP_activeBusiness");
-      }
-    }
-
-    if (editingId !== null && ERP.idEqual(editingId, id)) {
-      resetForm();
-    }
-
+    await loadCompanies();
     render();
   }
 
@@ -238,44 +260,63 @@
   /* ===== RENDER ===== */
 
   function render() {
-    ERP.updateActiveBadge();
+    renderBadge();
 
-    const businesses = ERP.getBusinesses();
-    const active = ERP.getActiveBusiness();
     const table = document.getElementById("businessTable");
-
     table.innerHTML = "";
 
-    if (businesses.length === 0) {
-      table.innerHTML = `<tr><td colspan="7" class="empty">Belum ada data usaha.</td></tr>`;
+    if (companies.length === 0) {
+      table.innerHTML = '<tr><td colspan="8" class="empty">Belum ada data usaha.</td></tr>';
       return;
     }
 
-    const activeId = active ? active.id : null;
+    const current = activeId();
 
-    businesses.forEach((business, index) => {
+    companies.forEach(function (business, index) {
       const row = document.createElement("tr");
-      const isActive = ERP.idEqual(business.id, activeId);
+      const isActive = ERP.idEqual(business.id, current);
+      const isOwner = business.role === "owner";
 
-      row.innerHTML = `
-        <td>${index + 1}</td>
-        <td><strong>${ERP.escapeHTML(business.name)}</strong></td>
-        <td>${ERP.escapeHTML(business.address || "-")}</td>
-        <td>${ERP.escapeHTML(business.period || "-")}</td>
-        <td>${business.periodStart ? ERP.formatDate(business.periodStart) : "Seluruh riwayat"}</td>
-        <td>${isActive ? `<span class="text-debit" style="color:var(--success)">✓ Usaha Aktif</span>` : "Tidak Aktif"}</td>
-        <td>
-          ${isActive ? "" : `<button class="btn-active" onclick="selectBusiness('${ERP.escapeHTML(business.id)}')">Pilih</button>`}
-          <button class="btn-edit" onclick="editBusiness('${ERP.escapeHTML(business.id)}')">✏️ Edit</button>
-          <button class="btn-delete" onclick="deleteBusiness('${ERP.escapeHTML(business.id)}')">🗑️ Hapus</button>
-        </td>
-      `;
+      row.innerHTML =
+        "<td>" + (index + 1) + "</td>" +
+        "<td><strong>" + ERP.escapeHTML(business.name) + "</strong></td>" +
+        "<td>" + ERP.escapeHTML(business.kode) + "</td>" +
+        "<td>" + ERP.escapeHTML(business.address || "-") + "</td>" +
+        "<td>" + ERP.escapeHTML(business.period || "-") + "</td>" +
+        "<td>" + (business.periodStart ? ERP.formatDate(business.periodStart) : "Seluruh riwayat") + "</td>" +
+        "<td>" + (isActive ? '<span class="text-debit" style="color:var(--success)">✓ Usaha Aktif</span>' : "Tidak Aktif") + "</td>" +
+        "<td>" +
+          (isActive ? "" : '<button class="btn-active" onclick="selectBusiness(\'' + ERP.escapeHTML(business.id) + '\')">Pilih</button> ') +
+          (isOwner
+            ? '<button class="btn-edit" onclick="editBusiness(\'' + ERP.escapeHTML(business.id) + '\')">✏️ Edit</button> ' +
+              '<button class="btn-delete" onclick="deleteBusiness(\'' + ERP.escapeHTML(business.id) + '\')">🗑️ Hapus</button>'
+            : "") +
+        "</td>";
 
       table.appendChild(row);
     });
   }
 
-  render();
+  /* ===== INISIALISASI ===== */
+
+  (async function init() {
+    ERP.initLayout({
+      active: "business",
+      title: "Data Usaha",
+      subtitle: "Kelola data usaha dan periode akuntansi"
+    });
+
+    try {
+      session = await requireAuth();
+      if (!session) return;
+
+      await loadCompanies();
+      document.documentElement.classList.remove("auth-pending");
+      render();
+    } catch (err) {
+      window.location.href = "login.html";
+    }
+  })();
 
 </script>
 

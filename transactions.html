@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Transaksi - Ilham ERP</title>
 <link rel="stylesheet" href="assets/style.css">
+<style>html.auth-pending body { visibility: hidden; }</style>
 </head>
 <body>
 
@@ -28,10 +29,12 @@
 
     <main class="content">
 
+      <div class="status-line" style="margin-bottom:10px"><a href="login.html">Ganti usaha</a> · <a href="#" id="logoutLink">Keluar</a></div>
+
       <div id="noBusinessWarning" class="warning-box" style="display:none">
         Belum ada usaha aktif.<br><br>
         Silakan buat atau pilih usaha terlebih dahulu.<br><br>
-        <a href="business.html">Buka Data Usaha</a>
+        <a href="login.html">Pilih atau buat usaha</a>
       </div>
 
       <div class="card">
@@ -144,17 +147,125 @@
 
 </div>
 
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.js"></script>
+<script src="assets/supabase-client.js"></script>
 <script src="assets/app.js"></script>
 <script>
 
-  ERP.initLayout({
-    active: "transactions",
-    title: "Transaksi",
-    subtitle: "Input transaksi dan pencatatan jurnal otomatis"
-  });
+  document.documentElement.classList.add("auth-pending");
 
   let editingId = null;
+  let businessId = null;
+  let businessInfo = null;      // { id, name, kode }
 
+  function getActiveBusinessInfo() { return businessInfo; }
+
+  async function loadBusinessInfo() {
+    const res = await supabaseClient.from("companies").select("id, nama, kode_usaha").eq("id", businessId).maybeSingle();
+    if (res.error || !res.data) { businessInfo = null; return; }
+    businessInfo = { id: res.data.id, name: res.data.nama, kode: res.data.kode_usaha };
+  }
+
+  function renderBadge() {
+    const badge = document.getElementById("activeBusinessBadge");
+    if (!badge) return;
+    if (!businessInfo) {
+      badge.innerHTML = '<span class="badge-dot badge-dot-warn"></span><span>Belum ada usaha aktif</span>';
+      badge.classList.add("is-empty");
+      return;
+    }
+    badge.classList.remove("is-empty");
+    badge.innerHTML = '<span class="badge-dot"></span><span><strong>' + ERP.escapeHTML(businessInfo.name) +
+      '</strong> · Kode ' + ERP.escapeHTML(businessInfo.kode) + '</span>';
+  }
+
+  function setBusy(isBusy) {
+    const btn = document.getElementById("saveButton");
+    if (btn) btn.disabled = isBusy;
+  }
+
+  // Ambil semua baris (Supabase membatasi 1000 baris per permintaan).
+  async function fetchAll(buildQuery) {
+    const pageSize = 1000;
+    let from = 0, all = [];
+    for (;;) {
+      const res = await buildQuery().range(from, from + pageSize - 1);
+      if (res.error) return { error: res.error, data: all };
+      all = all.concat(res.data);
+      if (res.data.length < pageSize) break;
+      from += pageSize;
+    }
+    return { error: null, data: all };
+  }
+
+  document.getElementById("logoutLink").addEventListener("click", function (e) {
+    e.preventDefault();
+    signOut();
+  });
+
+  /* =====================================================
+     LAPISAN DATA SUPABASE (akun + transaksi usaha aktif)
+  ===================================================== */
+
+  let accountsCache = [];
+  let txCache = [];
+
+  function getActiveAccounts() { return accountsCache; }
+  function getActiveTransactions() { return txCache; }
+  function getAccountById(id) { return accountsCache.find(function (a) { return ERP.idEqual(a.id, id); }) || null; }
+
+  function loadAccountDropdowns(debitId, creditId) {
+    const debitSelect = document.getElementById(debitId);
+    const creditSelect = document.getElementById(creditId);
+    const keepDebit = debitSelect.value, keepCredit = creditSelect.value;
+    ERP.fillAccountSelect(debitSelect, "-- Pilih Akun Debit --", accountsCache);
+    ERP.fillAccountSelect(creditSelect, "-- Pilih Akun Kredit --", accountsCache);
+    debitSelect.value = keepDebit;
+    creditSelect.value = keepCredit;
+  }
+
+  async function loadAccounts() {
+    const r = await fetchAll(function () {
+      return supabaseClient.from("accounts").select("id, code, name, grp, normal_balance, is_cash").eq("business_id", businessId).order("code");
+    });
+    if (r.error) { document.getElementById("statusMessage").textContent = "Gagal memuat akun: " + r.error.message; return false; }
+    accountsCache = r.data.map(function (x) {
+      return { id: x.id, code: x.code, name: x.name, group: x.grp, normalBalance: x.normal_balance, isCash: !!x.is_cash };
+    });
+    return true;
+  }
+
+  async function loadTransactions() {
+    const r = await fetchAll(function () {
+      return supabaseClient.from("transactions")
+        .select("id, tanggal, invoice, description, debit_account_id, credit_account_id, amount, source, source_id")
+        .eq("business_id", businessId).order("tanggal", { ascending: false }).order("created_at", { ascending: false });
+    });
+    if (r.error) { document.getElementById("statusMessage").textContent = "Gagal memuat transaksi: " + r.error.message; return false; }
+    txCache = r.data.map(function (x) {
+      return {
+        id: x.id, date: x.tanggal, invoice: x.invoice || "", description: x.description,
+        debitAccountId: x.debit_account_id, creditAccountId: x.credit_account_id,
+        amount: Number(x.amount) || 0, source: x.source, sourceId: x.source_id
+      };
+    });
+    return true;
+  }
+
+  async function insertChunks(rows) {
+    for (let i = 0; i < rows.length; i += 500) {
+      const res = await supabaseClient.from("transactions").insert(rows.slice(i, i + 500));
+      if (res.error) return { error: res.error, done: i };
+    }
+    return { error: null, done: rows.length };
+  }
+
+  function friendlyError(error) {
+    if (error.code === "23505") return "data ganda (transaksi dengan sumber yang sama sudah ada).";
+    if (error.code === "23503") return "akun yang dipilih tidak valid untuk usaha ini.";
+    if (error.code === "23514") return "data tidak memenuhi aturan (jumlah harus > 0, akun debit dan kredit harus berbeda).";
+    return error.message;
+  }
   /* ===== DEFAULT TANGGAL ===== */
 
   function setDefaultDate() {
@@ -217,7 +328,7 @@
     const prefix = "INV-" + ym + "-";
     let max = 0;
 
-    ERP.getActiveTransactions().forEach(function (t) {
+    getActiveTransactions().forEach(function (t) {
       const ref = String(t.invoice || "");
       if (ref.indexOf(prefix) === 0) {
         const n = parseInt(ref.slice(prefix.length), 10);
@@ -256,24 +367,14 @@
 
   document.getElementById("cancelButton").addEventListener("click", resetForm);
 
+
   /* ===== SIMPAN TRANSAKSI ===== */
 
-  document.getElementById("transactionForm").addEventListener("submit", function (event) {
+  document.getElementById("transactionForm").addEventListener("submit", async function (event) {
     event.preventDefault();
 
-    const business = ERP.getActiveBusiness();
-
-    if (!business) {
-      alert("Buat atau pilih usaha terlebih dahulu.");
-      return;
-    }
-
-    const accounts = ERP.getActiveAccounts();
-
-    if (accounts.length < 2) {
-      alert("Minimal harus ada 2 akun COA pada usaha aktif.");
-      return;
-    }
+    if (!businessInfo) { alert("Buat atau pilih usaha terlebih dahulu."); return; }
+    if (accountsCache.length < 2) { alert("Minimal harus ada 2 akun COA pada usaha aktif."); return; }
 
     const date = document.getElementById("transactionDate").value;
     if (editingId === null && document.getElementById("invoice").value.trim() === "") {
@@ -290,57 +391,28 @@
       alert("Lengkapi semua data transaksi.");
       return;
     }
+    if (ERP.idEqual(debitAccount, creditAccount)) { alert("Akun Debit dan Kredit tidak boleh sama."); return; }
+    if (!getAccountById(debitAccount) || !getAccountById(creditAccount)) { alert("Akun transaksi tidak valid."); return; }
 
-    if (ERP.idEqual(debitAccount, creditAccount)) {
-      alert("Akun Debit dan Kredit tidak boleh sama.");
-      return;
-    }
+    const payload = {
+      tanggal: date, invoice: invoice || null, description: description,
+      debit_account_id: debitAccount, credit_account_id: creditAccount, amount: amount
+    };
+    const wasEditing = editingId !== null;
 
-    const debitExists = accounts.some(a => ERP.idEqual(a.id, debitAccount));
-    const creditExists = accounts.some(a => ERP.idEqual(a.id, creditAccount));
-
-    if (!debitExists || !creditExists) {
-      alert("Akun transaksi tidak valid.");
-      return;
-    }
-
-    const transactions = ERP.getTransactions();
-
-    if (editingId !== null) {
-
-      const index = transactions.findIndex(t => ERP.idEqual(t.id, editingId) && ERP.idEqual(t.businessId, business.id));
-
-      if (index < 0) {
-        alert("Transaksi tidak ditemukan.");
-        return;
-      }
-
-      transactions[index] = {
-        ...transactions[index],
-        date, invoice, description,
-        debitAccountId: debitAccount,
-        creditAccountId: creditAccount,
-        amount
-      };
-
-      alert("Transaksi berhasil diperbarui.");
-
+    setBusy(true);
+    let res;
+    if (wasEditing) {
+      res = await supabaseClient.from("transactions").update(payload).eq("id", editingId).eq("business_id", businessId);
     } else {
-
-      transactions.push({
-        id: String(Date.now()),
-        businessId: business.id,
-        date, invoice, description,
-        debitAccountId: debitAccount,
-        creditAccountId: creditAccount,
-        amount,
-        createdAt: new Date().toISOString()
-      });
-
-      alert("Transaksi berhasil disimpan.");
+      res = await supabaseClient.from("transactions").insert(Object.assign({ business_id: businessId, source: "MANUAL" }, payload));
     }
+    setBusy(false);
 
-    ERP.saveTransactions(transactions);
+    if (res.error) { alert("Gagal menyimpan transaksi: " + friendlyError(res.error)); return; }
+
+    alert(wasEditing ? "Transaksi berhasil diperbarui." : "Transaksi berhasil disimpan.");
+    await loadTransactions();
     resetForm();
     render();
   });
@@ -348,13 +420,9 @@
   /* ===== EDIT TRANSAKSI ===== */
 
   function editTransaction(id) {
-    const business = ERP.getActiveBusiness();
-    const transaction = ERP.getActiveTransactions().find(t => ERP.idEqual(t.id, id));
+    const transaction = txCache.find(function (t) { return ERP.idEqual(t.id, id); });
 
-    if (!business || !transaction) {
-      alert("Transaksi tidak ditemukan.");
-      return;
-    }
+    if (!businessInfo || !transaction) { alert("Transaksi tidak ditemukan."); return; }
 
     editingId = transaction.id;
 
@@ -363,8 +431,7 @@
     invoiceAuto = false;
     document.getElementById("description").value = transaction.description || "";
 
-    // Pastikan dropdown terisi sebelum memilih akun.
-    ERP.loadAccountDropdowns("debitAccount", "creditAccount");
+    loadAccountDropdowns("debitAccount", "creditAccount");
 
     document.getElementById("debitAccount").value = transaction.debitAccountId || "";
     document.getElementById("creditAccount").value = transaction.creditAccountId || "";
@@ -379,31 +446,21 @@
 
   /* ===== HAPUS TRANSAKSI ===== */
 
-  function deleteTransaction(id) {
-    const business = ERP.getActiveBusiness();
-    if (!business) return;
+  async function deleteTransaction(id) {
+    if (!businessInfo) return;
 
-    const transactions = ERP.getTransactions();
-    const index = transactions.findIndex(t => ERP.idEqual(t.id, id) && ERP.idEqual(t.businessId, business.id));
+    const transaction = txCache.find(function (t) { return ERP.idEqual(t.id, id); });
+    if (!transaction) { alert("Transaksi tidak ditemukan."); return; }
 
-    if (index < 0) {
-      alert("Transaksi tidak ditemukan.");
-      return;
-    }
+    if (!confirm('Yakin ingin menghapus transaksi "' + transaction.description + '"?')) return;
 
-    const transaction = transactions[index];
-    const confirmed = confirm(`Yakin ingin menghapus transaksi "${transaction.description}"?`);
-
-    if (!confirmed) return;
-
-    transactions.splice(index, 1);
-    ERP.saveTransactions(transactions);
+    const res = await supabaseClient.from("transactions").delete().eq("id", id).eq("business_id", businessId);
+    if (res.error) { alert("Gagal menghapus transaksi: " + res.error.message); return; }
 
     if (ERP.idEqual(editingId, id)) resetForm();
-
+    await loadTransactions();
     render();
   }
-
 
   /* ===== IMPORT CSV (Kasir Catat.in) =====
      Satu transaksi kasir (transaction_id) = satu jurnal penjualan:
@@ -520,7 +577,7 @@
   /* --- Pemetaan akun (disimpan per usaha) --- */
 
   function loadImportMap() {
-    const business = ERP.getActiveBusiness();
+    const business = getActiveBusinessInfo();
     if (!business) return {};
     try {
       const all = JSON.parse(localStorage.getItem(IMPORT_MAP_KEY) || "{}");
@@ -529,7 +586,7 @@
   }
 
   function saveImportMap(map) {
-    const business = ERP.getActiveBusiness();
+    const business = getActiveBusinessInfo();
     if (!business) return;
     try {
       const all = JSON.parse(localStorage.getItem(IMPORT_MAP_KEY) || "{}");
@@ -574,7 +631,7 @@
   }
 
   function buildMappingUI(methods) {
-    const accounts = ERP.getActiveAccounts();
+    const accounts = getActiveAccounts();
     const saved = loadImportMap();
     const grid = document.getElementById("importMappingGrid");
     grid.innerHTML = "";
@@ -628,7 +685,7 @@
     const salesDone = {};
     const cogsDone = {};
 
-    ERP.getActiveTransactions().forEach(t => {
+    getActiveTransactions().forEach(t => {
       if (!t.sourceId) return;
       if (t.source === "catatin-hpp") cogsDone[t.sourceId] = true;
       else salesDone[t.sourceId] = true;
@@ -703,13 +760,13 @@
     const file = this.files && this.files[0];
     if (!file) { resetImport(); return; }
 
-    const business = ERP.getActiveBusiness();
+    const business = getActiveBusinessInfo();
     if (!business) {
       alert("Buat atau pilih usaha terlebih dahulu.");
       resetImport();
       return;
     }
-    if (ERP.getActiveAccounts().length < 2) {
+    if (getActiveAccounts().length < 2) {
       alert("Minimal harus ada 2 akun COA pada usaha aktif.");
       resetImport();
       return;
@@ -745,126 +802,148 @@
 
   document.getElementById("importCancel").addEventListener("click", resetImport);
 
-  document.getElementById("importButton").addEventListener("click", function () {
-    const business = ERP.getActiveBusiness();
-    if (!business) { alert("Buat atau pilih usaha terlebih dahulu."); return; }
+
+  document.getElementById("importButton").addEventListener("click", async function () {
+    if (!businessInfo) { alert("Buat atau pilih usaha terlebih dahulu."); return; }
 
     const map = currentMapping();
-    const results = evaluateGroups().filter(r => r.addSales || r.addCogs);
+    const results = evaluateGroups().filter(function (r) { return r.addSales || r.addCogs; });
 
     if (results.length === 0) { alert("Tidak ada transaksi yang bisa diimpor."); return; }
 
-    const nSales = results.filter(r => r.addSales).length;
-    const nCogs = results.filter(r => r.addCogs).length;
-    const confirmed = confirm(`Ke usaha "${business.name}": tambah ${nSales} jurnal penjualan dan ${nCogs} jurnal HPP?`);
-    if (!confirmed) return;
+    const nSales = results.filter(function (r) { return r.addSales; }).length;
+    const nCogs = results.filter(function (r) { return r.addCogs; }).length;
+    if (!confirm('Ke usaha "' + businessInfo.name + '": tambah ' + nSales + " jurnal penjualan dan " + nCogs + " jurnal HPP?")) return;
 
     saveImportMap(map);
 
-    const transactions = ERP.getTransactions();
-    const now = new Date().toISOString();
-
-    results.forEach(({ g, addSales, addCogs }, i) => {
-      if (addSales) {
-        transactions.push({
-          id: ERP.newId("imp") + "_" + i,
-          businessId: business.id,
-          date: g.date,
-          invoice: g.sourceId,
-          description: describeGroup(g),
-          debitAccountId: map[g.method],
-          creditAccountId: map["__revenue"],
-          amount: g.total,
-          sourceId: g.sourceId,
-          source: "catatin",
-          createdAt: now
+    const rows = [];
+    results.forEach(function (r) {
+      const g = r.g;
+      if (r.addSales) {
+        rows.push({
+          business_id: businessId, tanggal: g.date, invoice: g.sourceId, description: describeGroup(g),
+          debit_account_id: map[g.method], credit_account_id: map["__revenue"], amount: g.total,
+          source: "catatin", source_id: g.sourceId
         });
       }
-      if (addCogs) {
-        transactions.push({
-          id: ERP.newId("imp") + "_" + i + "h",
-          businessId: business.id,
-          date: g.date,
-          invoice: g.sourceId,
-          description: describeCogs(g),
-          debitAccountId: map["__cogs"],
-          creditAccountId: map["__inventory"],
-          amount: g.cogs,
-          sourceId: g.sourceId,
-          source: "catatin-hpp",
-          createdAt: now
+      if (r.addCogs) {
+        rows.push({
+          business_id: businessId, tanggal: g.date, invoice: g.sourceId, description: describeCogs(g),
+          debit_account_id: map["__cogs"], credit_account_id: map["__inventory"], amount: g.cogs,
+          source: "catatin-hpp", source_id: g.sourceId
         });
       }
     });
 
-    ERP.saveTransactions(transactions);
+    const importBtn = document.getElementById("importButton");
+    importBtn.disabled = true;
+    const res = await insertChunks(rows);
+
+    await loadTransactions();
+
+    if (res.error) {
+      alert("Impor berhenti: " + friendlyError(res.error) + "\n" + res.done + " dari " + rows.length +
+            " baris sudah masuk. Pilih file yang sama lagi untuk melanjutkan; yang sudah masuk otomatis dilewati.");
+      resetImport();
+      render();
+      return;
+    }
+
     resetImport();
     resetForm();
     render();
-    alert(`${nSales} jurnal penjualan dan ${nCogs} jurnal HPP berhasil diimpor.`);
+    alert(nSales + " jurnal penjualan dan " + nCogs + " jurnal HPP berhasil diimpor.");
   });
+
 
   /* ===== RENDER ===== */
 
   function renderActiveBusiness() {
-    const business = ERP.getActiveBusiness();
     const warning = document.getElementById("noBusinessWarning");
     const status = document.getElementById("statusMessage");
 
-    ERP.updateActiveBadge();
+    renderBadge();
 
-    if (!business) {
+    if (!businessInfo) {
       warning.style.display = "block";
       status.textContent = "Buat atau pilih usaha terlebih dahulu.";
       return;
     }
 
     warning.style.display = "none";
-    status.textContent = `Usaha aktif: ${business.name} | COA tersedia: ${ERP.getActiveAccounts().length} akun`;
+    status.textContent = "Usaha aktif: " + businessInfo.name + " | COA tersedia: " + accountsCache.length + " akun | Transaksi: " + txCache.length;
   }
 
   function render() {
     renderActiveBusiness();
-    ERP.loadAccountDropdowns("debitAccount", "creditAccount");
+    loadAccountDropdowns("debitAccount", "creditAccount");
 
     const table = document.getElementById("transactionTable");
-    const transactions = ERP.getActiveTransactions()
-      .slice()
-      .sort((a, b) => String(b.date).localeCompare(String(a.date)));
+    const transactions = txCache.slice().sort(function (a, b) { return String(b.date).localeCompare(String(a.date)); });
 
     table.innerHTML = "";
 
     if (transactions.length === 0) {
-      table.innerHTML = `<tr><td colspan="8" class="empty">Belum ada transaksi untuk usaha aktif.</td></tr>`;
+      table.innerHTML = '<tr><td colspan="8" class="empty">Belum ada transaksi untuk usaha aktif.</td></tr>';
       return;
     }
 
-    transactions.forEach((transaction, index) => {
-      const debit = ERP.getAccountById(transaction.debitAccountId);
-      const credit = ERP.getAccountById(transaction.creditAccountId);
+    transactions.forEach(function (transaction, index) {
+      const debit = getAccountById(transaction.debitAccountId);
+      const credit = getAccountById(transaction.creditAccountId);
       const row = document.createElement("tr");
 
-      row.innerHTML = `
-        <td>${index + 1}</td>
-        <td>${ERP.escapeHTML(transaction.date)}</td>
-        <td>${ERP.escapeHTML(transaction.invoice || "-")}</td>
-        <td>${ERP.escapeHTML(transaction.description)}</td>
-        <td class="debit">${debit ? `${ERP.escapeHTML(debit.code)} - ${ERP.escapeHTML(debit.name)}` : "-"}</td>
-        <td class="credit">${credit ? `${ERP.escapeHTML(credit.code)} - ${ERP.escapeHTML(credit.name)}` : "-"}</td>
-        <td class="number">${ERP.formatMoney(transaction.amount)}</td>
-        <td>
-          <button class="btn-edit" onclick="editTransaction('${ERP.escapeHTML(transaction.id)}')">✏️ Edit</button>
-          <button class="btn-delete" onclick="deleteTransaction('${ERP.escapeHTML(transaction.id)}')">🗑️ Hapus</button>
-        </td>
-      `;
+      row.innerHTML =
+        "<td>" + (index + 1) + "</td>" +
+        "<td>" + ERP.escapeHTML(transaction.date) + "</td>" +
+        "<td>" + ERP.escapeHTML(transaction.invoice || "-") + "</td>" +
+        "<td>" + ERP.escapeHTML(transaction.description) + "</td>" +
+        '<td class="debit">' + (debit ? ERP.escapeHTML(debit.code) + " - " + ERP.escapeHTML(debit.name) : "-") + "</td>" +
+        '<td class="credit">' + (credit ? ERP.escapeHTML(credit.code) + " - " + ERP.escapeHTML(credit.name) : "-") + "</td>" +
+        '<td class="number">' + ERP.formatMoney(transaction.amount) + "</td>" +
+        "<td>" +
+          '<button class="btn-edit" onclick="editTransaction(\'' + ERP.escapeHTML(transaction.id) + '\')">✏️ Edit</button> ' +
+          '<button class="btn-delete" onclick="deleteTransaction(\'' + ERP.escapeHTML(transaction.id) + '\')">🗑️ Hapus</button>' +
+        "</td>";
 
       table.appendChild(row);
     });
   }
 
-  setDefaultDate();
-  fillInvoice();
-  render();
+  /* ===== INISIALISASI ===== */
+
+  (async function init() {
+    ERP.initLayout({
+      active: "transactions",
+      title: "Transaksi",
+      subtitle: "Input transaksi dan pencatatan jurnal otomatis"
+    });
+
+    try {
+      const ctx = await requireBusiness();
+      if (!ctx) return;
+
+      businessId = ctx.businessId;
+      await loadBusinessInfo();
+
+      if (!businessInfo) {
+        clearActiveBusinessId();
+        window.location.href = "login.html";
+        return;
+      }
+
+      await loadAccounts();
+      await loadTransactions();
+      document.documentElement.classList.remove("auth-pending");
+
+      setDefaultDate();
+      fillInvoice();
+      render();
+    } catch (err) {
+      window.location.href = "login.html";
+    }
+  })();
 
 </script>
 
