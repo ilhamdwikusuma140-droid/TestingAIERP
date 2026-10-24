@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Chart of Accounts - Ilham ERP</title>
 <link rel="stylesheet" href="assets/style.css">
+<style>html.auth-pending body { visibility: hidden; }</style>
 </head>
 <body>
 
@@ -28,10 +29,12 @@
 
     <main class="content">
 
+      <div class="status-line" style="margin-bottom:10px"><a href="login.html">Ganti usaha</a> · <a href="#" id="logoutLink">Keluar</a></div>
+
       <div id="noBusinessWarning" class="warning-box" style="display:none">
         Belum ada usaha aktif.<br><br>
         Silakan buat atau pilih usaha terlebih dahulu.<br><br>
-        <a href="business.html">Buka Data Usaha</a>
+        <a href="login.html">Pilih atau buat usaha</a>
       </div>
 
 
@@ -150,25 +153,81 @@
 
 </div>
 
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.js"></script>
+<script src="assets/supabase-client.js"></script>
 <script src="assets/app.js"></script>
 <script>
 
-  ERP.initLayout({
-    active: "accounts",
-    title: "Chart of Accounts",
-    subtitle: "Daftar akun berdasarkan usaha yang sedang aktif"
-  });
+  /* =====================================================
+     LAPISAN DATA SUPABASE
+     Akun disimpan di tabel public.accounts (per usaha aktif),
+     bukan lagi di localStorage.
+  ===================================================== */
+
+  document.documentElement.classList.add("auth-pending");
 
   let editingId = null;
+  let businessId = null;
+  let businessInfo = null;     // { id, name, kode }
+  let accountsCache = [];      // akun usaha aktif, bentuk lama: id, code, name, group, normalBalance, isCash
+
+  function getActiveAccounts() { return accountsCache; }
+  function getActiveBusinessInfo() { return businessInfo; }
+
+  function mapRow(r) {
+    return { id: r.id, code: r.code, name: r.name, group: r.grp, normalBalance: r.normal_balance, isCash: !!r.is_cash };
+  }
+
+  async function loadBusinessInfo() {
+    const res = await supabaseClient.from("companies").select("id, nama, kode_usaha").eq("id", businessId).maybeSingle();
+    if (res.error || !res.data) { businessInfo = null; return; }
+    businessInfo = { id: res.data.id, name: res.data.nama, kode: res.data.kode_usaha };
+  }
+
+  async function loadAccounts() {
+    const res = await supabaseClient
+      .from("accounts")
+      .select("id, code, name, grp, normal_balance, is_cash")
+      .eq("business_id", businessId)
+      .order("code")
+      .range(0, 4999);
+    if (res.error) {
+      document.getElementById("statusMessage").textContent = "Gagal memuat akun: " + res.error.message;
+      return false;
+    }
+    accountsCache = res.data.map(mapRow);
+    return true;
+  }
+
+  function renderBadge() {
+    const badge = document.getElementById("activeBusinessBadge");
+    if (!badge) return;
+    if (!businessInfo) {
+      badge.innerHTML = '<span class="badge-dot badge-dot-warn"></span><span>Belum ada usaha aktif</span>';
+      badge.classList.add("is-empty");
+      return;
+    }
+    badge.classList.remove("is-empty");
+    badge.innerHTML = '<span class="badge-dot"></span><span><strong>' + ERP.escapeHTML(businessInfo.name) +
+      '</strong> · Kode ' + ERP.escapeHTML(businessInfo.kode) + '</span>';
+  }
+
+  function setBusy(isBusy) {
+    document.getElementById("saveButton").disabled = isBusy;
+    document.getElementById("loadTemplateButton").disabled = isBusy;
+  }
+
+  document.getElementById("logoutLink").addEventListener("click", function (e) {
+    e.preventDefault();
+    signOut();
+  });
 
   /* ===== SIMPAN AKUN ===== */
 
-  document.getElementById("accountForm").addEventListener("submit", function (event) {
+  document.getElementById("accountForm").addEventListener("submit", async function (event) {
     event.preventDefault();
 
-    const business = ERP.getActiveBusiness();
-
-    if (!business) {
+    if (!businessInfo) {
       alert("Buat atau pilih usaha terlebih dahulu.");
       return;
     }
@@ -184,59 +243,44 @@
       return;
     }
 
-    const accounts = ERP.getAccounts();
-
-    const duplicate = accounts.some(account =>
-      ERP.idEqual(account.businessId, business.id) &&
-      String(account.code).toLowerCase() === code.toLowerCase() &&
-      !ERP.idEqual(account.id, editingId)
-    );
+    const duplicate = accountsCache.some(function (account) {
+      return String(account.code).toLowerCase() === code.toLowerCase() && !ERP.idEqual(account.id, editingId);
+    });
 
     if (duplicate) {
       alert("Kode akun tersebut sudah digunakan pada usaha aktif.");
       return;
     }
 
-    if (editingId !== null) {
+    const payload = { code: code, name: name, grp: group, normal_balance: normalBalance, is_cash: isCash };
+    const wasEditing = editingId !== null;
 
-      const index = accounts.findIndex(a => ERP.idEqual(a.id, editingId));
-
-      if (index < 0 || !ERP.idEqual(accounts[index].businessId, business.id)) {
-        alert("Akun tidak ditemukan pada usaha aktif.");
-        return;
-      }
-
-      accounts[index] = { ...accounts[index], code, name, group, normalBalance, isCash };
-      alert("Akun berhasil diperbarui.");
-
+    setBusy(true);
+    let res;
+    if (wasEditing) {
+      res = await supabaseClient.from("accounts").update(payload).eq("id", editingId).eq("business_id", businessId);
     } else {
+      res = await supabaseClient.from("accounts").insert(Object.assign({ business_id: businessId }, payload));
+    }
+    setBusy(false);
 
-      accounts.push({
-        id: String(Date.now()),
-        businessId: business.id,
-        code,
-        name,
-        group,
-        normalBalance,
-        isCash,
-        createdAt: new Date().toISOString()
-      });
-
-      alert("Akun berhasil disimpan.");
+    if (res.error) {
+      alert("Gagal menyimpan akun: " + (res.error.code === "23505" ? "kode akun sudah dipakai." : res.error.message));
+      return;
     }
 
-    ERP.saveAccounts(accounts);
+    alert(wasEditing ? "Akun berhasil diperbarui." : "Akun berhasil disimpan.");
     resetForm();
+    await loadAccounts();
     render();
   });
 
   /* ===== EDIT AKUN ===== */
 
   function editAccount(id) {
-    const business = ERP.getActiveBusiness();
-    const account = ERP.getActiveAccounts().find(a => ERP.idEqual(a.id, id));
+    const account = accountsCache.find(function (a) { return ERP.idEqual(a.id, id); });
 
-    if (!business || !account) {
+    if (!businessInfo || !account) {
       alert("Akun tidak ditemukan pada usaha aktif.");
       return;
     }
@@ -258,29 +302,29 @@
 
   /* ===== HAPUS AKUN ===== */
 
-  function deleteAccount(id) {
-    const business = ERP.getActiveBusiness();
-    if (!business) return;
+  async function deleteAccount(id) {
+    if (!businessInfo) return;
 
-    const accounts = ERP.getAccounts();
+    const account = accountsCache.find(function (a) { return ERP.idEqual(a.id, id); });
 
-    const index = accounts.findIndex(a => ERP.idEqual(a.id, id) && ERP.idEqual(a.businessId, business.id));
-
-    if (index < 0) {
+    if (!account) {
       alert("Akun tidak ditemukan pada usaha aktif.");
       return;
     }
 
-    const account = accounts[index];
-    const confirmed = confirm(`Yakin ingin menghapus akun "${account.code} - ${account.name}"?`);
+    if (!confirm('Yakin ingin menghapus akun "' + account.code + ' - ' + account.name + '"?')) return;
 
-    if (!confirmed) return;
+    const res = await supabaseClient.from("accounts").delete().eq("id", id).eq("business_id", businessId);
 
-    accounts.splice(index, 1);
-    ERP.saveAccounts(accounts);
+    if (res.error) {
+      alert("Gagal menghapus akun: " + (res.error.code === "23503"
+        ? "akun ini sudah dipakai di jurnal, jadi tidak bisa dihapus."
+        : res.error.message));
+      return;
+    }
 
     if (ERP.idEqual(editingId, id)) resetForm();
-
+    await loadAccounts();
     render();
   }
 
@@ -297,23 +341,23 @@
     document.getElementById("cancelButton").style.display = "none";
   }
 
+
   /* ===== RENDER ===== */
 
   function renderActive() {
-    const business = ERP.getActiveBusiness();
     const warning = document.getElementById("noBusinessWarning");
     const status = document.getElementById("statusMessage");
 
-    ERP.updateActiveBadge();
+    renderBadge();
 
-    if (!business) {
+    if (!businessInfo) {
       warning.style.display = "block";
       status.textContent = "Buat atau pilih usaha terlebih dahulu.";
       return;
     }
 
     warning.style.display = "none";
-    status.textContent = `COA untuk usaha aktif: ${business.name} (${ERP.getActiveAccounts().length} akun)`;
+    status.textContent = "COA untuk usaha aktif: " + businessInfo.name + " (" + accountsCache.length + " akun)";
   }
 
   function render() {
@@ -321,36 +365,34 @@
     if (typeof updateTemplatePreview === "function") updateTemplatePreview();
 
     const table = document.getElementById("accountTable");
-    const accounts = ERP.getActiveAccounts()
+    const accounts = accountsCache
       .slice()
-      .sort((a, b) => String(a.code).localeCompare(String(b.code), undefined, { numeric: true }));
+      .sort(function (a, b) { return String(a.code).localeCompare(String(b.code), undefined, { numeric: true }); });
 
     table.innerHTML = "";
 
     if (accounts.length === 0) {
-      table.innerHTML = `<tr><td colspan="6" class="empty">Belum ada COA untuk usaha aktif.</td></tr>`;
+      table.innerHTML = '<tr><td colspan="6" class="empty">Belum ada COA untuk usaha aktif. Pilih jenis usaha di atas lalu klik Muat Template COA.</td></tr>';
       return;
     }
 
-    accounts.forEach((account, index) => {
+    accounts.forEach(function (account, index) {
       const row = document.createElement("tr");
 
-      row.innerHTML = `
-        <td>${index + 1}</td>
-        <td><strong>${ERP.escapeHTML(account.code)}</strong></td>
-        <td>${ERP.escapeHTML(account.name)}${account.isCash ? ' <span title="Akun Kas/Bank">💰</span>' : ''}</td>
-        <td>${ERP.escapeHTML(account.group)}</td>
-        <td>${ERP.escapeHTML(account.normalBalance)}</td>
-        <td>
-          <button class="btn-edit" onclick="editAccount('${ERP.escapeHTML(account.id)}')">✏️ Edit</button>
-          <button class="btn-delete" onclick="deleteAccount('${ERP.escapeHTML(account.id)}')">🗑️ Hapus</button>
-        </td>
-      `;
+      row.innerHTML =
+        "<td>" + (index + 1) + "</td>" +
+        "<td><strong>" + ERP.escapeHTML(account.code) + "</strong></td>" +
+        "<td>" + ERP.escapeHTML(account.name) + (account.isCash ? ' <span title="Akun Kas/Bank">💰</span>' : "") + "</td>" +
+        "<td>" + ERP.escapeHTML(account.group) + "</td>" +
+        "<td>" + ERP.escapeHTML(account.normalBalance) + "</td>" +
+        "<td>" +
+          '<button class="btn-edit" onclick="editAccount(\'' + ERP.escapeHTML(account.id) + '\')">✏️ Edit</button> ' +
+          '<button class="btn-delete" onclick="deleteAccount(\'' + ERP.escapeHTML(account.id) + '\')">🗑️ Hapus</button>' +
+        "</td>";
 
       table.appendChild(row);
     });
   }
-
 
   /* =====================================================
      COA OTOMATIS
@@ -517,7 +559,7 @@
   // - nama sudah ada            -> dilewati
   // - kode sudah dipakai akun lain -> akun baru dapat kode kosong berikutnya
   function planTemplate(type) {
-    const existing = ERP.getActiveAccounts();
+    const existing = getActiveAccounts();
     const usedCodes = new Set(existing.map(function (a) { return String(a.code).toLowerCase(); }));
     const usedNames = new Set(existing.map(function (a) { return String(a.name).trim().toLowerCase(); }));
     const toAdd = [], skipped = [];
@@ -552,7 +594,7 @@
     const type = document.getElementById("templateType").value;
     renderTemplateList(type);
 
-    const business = ERP.getActiveBusiness();
+    const business = getActiveBusinessInfo();
     if (!business) { box.textContent = "Buat atau pilih usaha terlebih dahulu."; return; }
 
     const plan = planTemplate(type);
@@ -563,9 +605,9 @@
 
   document.getElementById("templateType").addEventListener("change", updateTemplatePreview);
 
-  document.getElementById("loadTemplateButton").addEventListener("click", function () {
-    const business = ERP.getActiveBusiness();
-    if (!business) { alert("Buat atau pilih usaha terlebih dahulu."); return; }
+
+  document.getElementById("loadTemplateButton").addEventListener("click", async function () {
+    if (!businessInfo) { alert("Buat atau pilih usaha terlebih dahulu."); return; }
 
     const type = document.getElementById("templateType").value;
     const plan = planTemplate(type);
@@ -575,28 +617,25 @@
       return;
     }
 
-    const msg = "Tambahkan " + plan.toAdd.length + " akun ke COA \"" + business.name + "\"?\n" +
+    const msg = "Tambahkan " + plan.toAdd.length + " akun ke COA \"" + businessInfo.name + "\"?\n" +
       "(" + plan.skipped.length + " akun dilewati karena namanya sudah ada" +
       (plan.reassigned ? "; " + plan.reassigned + " akun diberi kode lain karena kodenya bentrok" : "") + ".)";
     if (!confirm(msg)) return;
 
-    const accounts = ERP.getAccounts();
-    const now = Date.now();
-
-    plan.toAdd.forEach(function (t, i) {
-      accounts.push({
-        id: String(now + i),
-        businessId: business.id,
-        code: t.code,
-        name: t.name,
-        group: t.group,
-        normalBalance: t.normalBalance,
-        isCash: t.isCash,
-        createdAt: new Date().toISOString()
-      });
+    const rows = plan.toAdd.map(function (t) {
+      return { business_id: businessId, code: t.code, name: t.name, grp: t.group, normal_balance: t.normalBalance, is_cash: t.isCash };
     });
 
-    ERP.saveAccounts(accounts);
+    setBusy(true);
+    const res = await supabaseClient.from("accounts").insert(rows);
+    setBusy(false);
+
+    if (res.error) {
+      alert("Gagal menambahkan template: " + res.error.message);
+      return;
+    }
+
+    await loadAccounts();
     render();
     alert(plan.toAdd.length + " akun berhasil ditambahkan.");
   });
@@ -615,7 +654,7 @@
   function suggestNextCode(group) {
     const prefix = GROUP_PREFIX[group];
     if (!prefix) return "";
-    const nums = ERP.getActiveAccounts()
+    const nums = getActiveAccounts()
       .map(function (a) { return String(a.code); })
       .filter(function (c) { return /^\d{4}$/.test(c) && c.indexOf(prefix) === 0; })
       .map(Number);
@@ -668,7 +707,36 @@
     balanceAutoSet = false;
   };
 
-  render();
+
+  /* ===== INISIALISASI ===== */
+
+  (async function init() {
+    ERP.initLayout({
+      active: "accounts",
+      title: "Chart of Accounts",
+      subtitle: "Daftar akun berdasarkan usaha yang sedang aktif"
+    });
+
+    try {
+      const ctx = await requireBusiness();   // belum login / belum pilih usaha -> ke login.html
+      if (!ctx) return;
+
+      businessId = ctx.businessId;
+      await loadBusinessInfo();
+
+      if (!businessInfo) {               // id usaha tersimpan sudah tidak valid
+        clearActiveBusinessId();
+        window.location.href = "login.html";
+        return;
+      }
+
+      await loadAccounts();
+      document.documentElement.classList.remove("auth-pending");
+      render();
+    } catch (err) {
+      window.location.href = "login.html";
+    }
+  })();
 
 </script>
 
