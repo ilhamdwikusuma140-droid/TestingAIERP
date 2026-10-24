@@ -5,6 +5,21 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Ilham ERP — Dashboard</title>
 <link rel="stylesheet" href="assets/style.css">
+<style>html.auth-pending body { visibility: hidden; }</style>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.js"></script>
+<script src="assets/supabase-client.js"></script>
+<script>
+  // Guard: wajib login dan sudah memilih usaha, jika tidak diarahkan ke login.html
+  document.documentElement.classList.add("auth-pending");
+  (async function () {
+    try {
+      var ok = await requireBusiness();
+      if (ok) document.documentElement.classList.remove("auth-pending");
+    } catch (e) {
+      window.location.href = "login.html";
+    }
+  })();
+</script>
 </head>
 <body>
 
