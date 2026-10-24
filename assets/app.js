@@ -96,6 +96,96 @@ const ERP = (function () {
     });
   }
 
+  /* ---------- MODE SUPABASE ----------
+     Halaman yang sudah dimigrasi memanggil ERP.boot(renderFn). Data usaha, akun,
+     dan transaksi dimuat sekali dari Supabase ke memori, lalu fungsi getActive*
+     di bawah otomatis membaca dari memori itu (bukan localStorage). Seluruh rumus
+     laporan tetap sama. Halaman yang belum dimigrasi tetap memakai localStorage. */
+
+  let remote = { loaded: false, business: null, accounts: [], transactions: [] };
+
+  async function fetchAllRows(buildQuery) {
+    const pageSize = 1000;
+    let from = 0, all = [];
+    for (;;) {
+      const res = await buildQuery().range(from, from + pageSize - 1);
+      if (res.error) throw res.error;
+      all = all.concat(res.data);
+      if (res.data.length < pageSize) break;
+      from += pageSize;
+    }
+    return all;
+  }
+
+  async function loadRemote(businessId) {
+    const c = await supabaseClient.from("companies")
+      .select("id, nama, kode_usaha, alamat, tahun_buku, period_start")
+      .eq("id", businessId).maybeSingle();
+    if (c.error) throw c.error;
+    if (!c.data) return false;
+
+    const accRows = await fetchAllRows(function () {
+      return supabaseClient.from("accounts")
+        .select("id, code, name, grp, normal_balance, is_cash")
+        .eq("business_id", businessId).order("code");
+    });
+    const txRows = await fetchAllRows(function () {
+      return supabaseClient.from("transactions")
+        .select("id, tanggal, invoice, description, debit_account_id, credit_account_id, amount, source, source_id, created_at")
+        .eq("business_id", businessId).order("tanggal").order("created_at");
+    });
+
+    remote = {
+      loaded: true,
+      business: {
+        id: c.data.id,
+        name: c.data.nama,
+        kode: c.data.kode_usaha,
+        address: c.data.alamat || "",
+        period: c.data.tahun_buku ? String(c.data.tahun_buku) : "",
+        periodStart: c.data.period_start || ""
+      },
+      accounts: accRows.map(function (a) {
+        return {
+          id: a.id, businessId: businessId, code: a.code, name: a.name,
+          group: a.grp, normalBalance: a.normal_balance, isCash: !!a.is_cash
+        };
+      }),
+      transactions: txRows.map(function (t) {
+        return {
+          id: t.id, businessId: businessId, date: t.tanggal, invoice: t.invoice || "",
+          description: t.description, debitAccountId: t.debit_account_id,
+          creditAccountId: t.credit_account_id, amount: Number(t.amount) || 0,
+          source: t.source, sourceId: t.source_id, createdAt: t.created_at
+        };
+      })
+    };
+    return true;
+  }
+
+  // Titik masuk halaman laporan: wajib login + usaha aktif, muat data, lalu render.
+  async function boot(renderFn) {
+    try {
+      const ctx = await requireBusiness();
+      if (!ctx) return;
+
+      const ok = await loadRemote(ctx.businessId);
+      if (!ok) {
+        clearActiveBusinessId();
+        window.location.href = "login.html";
+        return;
+      }
+
+      document.documentElement.classList.remove("auth-pending");
+      updateActiveBadge();
+      renderFn();
+    } catch (error) {
+      console.error(error);
+      document.documentElement.classList.remove("auth-pending");
+      alert("Gagal memuat data dari server: " + (error && error.message ? error.message : error));
+    }
+  }
+
   /* ---------- USAHA (BUSINESS) ---------- */
 
   function getBusinesses() {
@@ -107,6 +197,8 @@ const ERP = (function () {
   }
 
   function getActiveBusiness() {
+    if (remote.loaded) return remote.business;
+
     const businesses = getBusinesses();
 
     if (businesses.length === 0) {
@@ -165,6 +257,8 @@ const ERP = (function () {
   }
 
   function getActiveAccounts() {
+    if (remote.loaded) return remote.accounts;
+
     migrateLegacyAccounts();
 
     const business = getActiveBusiness();
@@ -174,6 +268,7 @@ const ERP = (function () {
   }
 
   function getAccountById(id) {
+    if (remote.loaded) return remote.accounts.find(account => idEqual(account.id, id)) || null;
     return getAccounts().find(account => idEqual(account.id, id)) || null;
   }
 
@@ -188,6 +283,8 @@ const ERP = (function () {
   }
 
   function getActiveTransactions() {
+    if (remote.loaded) return remote.transactions;
+
     const business = getActiveBusiness();
     if (!business) return [];
     return getTransactions().filter(t => idEqual(t.businessId, business.id));
@@ -588,6 +685,17 @@ const ERP = (function () {
     { id: "psak115",           label: "PSAK 115",              icon: "📑", href: "psak115.html",           group: "Modul Khusus" }
   ];
 
+  function accountLinksHtml() {
+    if (typeof supabaseClient === "undefined" || typeof signOut !== "function") return "";
+    return `
+      <div class="nav-group">
+        <div class="nav-group-title">Akun</div>
+        <a href="login.html" class="nav-link"><span class="nav-icon">🔁</span><span>Ganti usaha</span></a>
+        <a href="#" class="nav-link" id="navLogout"><span class="nav-icon">🚪</span><span>Keluar</span></a>
+      </div>
+    `;
+  }
+
   function buildSidebar(activeId) {
     const groups = [];
     NAV_ITEMS.forEach(item => {
@@ -619,7 +727,7 @@ const ERP = (function () {
           <div class="brand-subtitle">Accounting Learning System</div>
         </div>
       </div>
-      <nav class="sidebar-nav">${groupsHtml}</nav>
+      <nav class="sidebar-nav">${groupsHtml}${accountLinksHtml()}</nav>
     `;
   }
 
@@ -653,6 +761,14 @@ const ERP = (function () {
     const appShell = document.querySelector(".app-shell");
 
     if (sidebar) sidebar.innerHTML = buildSidebar(options.active);
+
+    const navLogout = document.getElementById("navLogout");
+    if (navLogout) {
+      navLogout.addEventListener("click", function (event) {
+        event.preventDefault();
+        signOut();
+      });
+    }
     if (topbarTitle) topbarTitle.textContent = options.title || "";
     if (topbarSubtitle) topbarSubtitle.textContent = options.subtitle || "";
 
@@ -737,7 +853,9 @@ const ERP = (function () {
     loadAccountDropdowns,
     fillAccountSelect,
     updateActiveBadge,
-    initLayout
+    initLayout,
+    loadRemote,
+    boot
   };
 
 })();
